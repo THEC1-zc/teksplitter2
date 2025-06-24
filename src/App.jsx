@@ -1,98 +1,133 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { ethers } from 'ethers';
 import './App.css';
 
 const CONTRACT_ADDRESS = '0x798763FF2cb11523344Fca274A19C393B3D921eF';
-const CONTRACT_ABI = [
-  "function distribute(address tokenAddress) external"
-];
+const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 
 function App() {
-  const [walletConnected, setWalletConnected] = useState(false);
   const [account, setAccount] = useState(null);
   const [provider, setProvider] = useState(null);
-  const [contract, setContract] = useState(null);
-  const [tokenList, setTokenList] = useState([]);
-  const [status, setStatus] = useState("");
+  const [tokens, setTokens] = useState([]);
+  const [status, setStatus] = useState('');
 
-  async function connectWallet() {
-    if (!window.ethereum) return alert("Installa MetaMask");
+  useEffect(() => {
+    if (window.ethereum) {
+      const ethProvider = new ethers.BrowserProvider(window.ethereum);
+      setProvider(ethProvider);
+    }
+  }, []);
 
-    const prov = new ethers.BrowserProvider(window.ethereum);
-    const signer = await prov.getSigner();
-    const acc = await signer.getAddress();
+  const connectWallet = async () => {
+    if (!provider) return;
+    const signer = await provider.getSigner();
+    const addr = await signer.getAddress();
+    setAccount(addr);
+  };
 
-    const ct = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-    setProvider(prov);
-    setContract(ct);
-    setWalletConnected(true);
-    setAccount(acc);
+  const fetchTokens = async () => {
+    if (!provider) return;
 
-    await loadTokens(prov);
-  }
-
-  async function loadTokens(prov) {
-    const logs = await prov.send("eth_getLogs", [{
-      address: CONTRACT_ADDRESS,
+    const logs = await provider.send("eth_getLogs", [{
       fromBlock: "0x0",
       toBlock: "latest",
-      topics: ["0xddf252ad"] // ERC20 Transfer event signature
+      topics: [
+        TRANSFER_TOPIC,
+        null,
+        ethers.hexZeroPad(CONTRACT_ADDRESS.toLowerCase(), 32)
+      ]
     }]);
-    const tokens = Array.from(new Set(logs.map(l => l.address)));
-    const erc20 = [
-      "function balanceOf(address) view returns (uint256)",
-      "function decimals() view returns (uint8)",
-      "function symbol() view returns (string)"
-    ];
-    const list = [];
-    for (const addr of tokens) {
+
+    const tokenAddresses = [...new Set(logs.map(log => log.address.toLowerCase()))];
+    const signer = await provider.getSigner();
+
+    const tokensWithData = await Promise.all(tokenAddresses.map(async (tokenAddress) => {
       try {
-        const tk = new ethers.Contract(addr, erc20, prov);
-        const bal = await tk.balanceOf(CONTRACT_ADDRESS);
-        if (bal > 0n) {
-          const dec = await tk.decimals();
-          const sym = await tk.symbol();
-          list.push({ address: addr, balance: bal, decimals: dec, symbol: sym });
-        }
+        const abi = [
+          "function symbol() view returns (string)",
+          "function name() view returns (string)",
+          "function decimals() view returns (uint8)",
+          "function balanceOf(address) view returns (uint)"
+        ];
+        const token = new ethers.Contract(tokenAddress, abi, provider);
+        const [symbol, name, decimals, balance] = await Promise.all([
+          token.symbol(),
+          token.name(),
+          token.decimals(),
+          token.balanceOf(CONTRACT_ADDRESS)
+        ]);
+        return { address: tokenAddress, symbol, name, balance, decimals };
       } catch (e) {
-        console.warn(`Errore token ${addr}`, e);
+        return null;
       }
+    }));
+
+    setTokens(tokensWithData.filter(t => t && t.balance > 0));
+  };
+
+  const distributeAll = async () => {
+    if (!provider || !account) return;
+    setStatus('Distributing all tokens...');
+    try {
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, ["function distribute(address token)"], signer);
+      for (const token of tokens) {
+        const tx = await contract.distribute(token.address);
+        await tx.wait();
+      }
+      setStatus('All tokens distributed!');
+    } catch (err) {
+      setStatus('Distribution failed.');
+      console.error(err);
     }
-    setTokenList(list);
-  }
+  };
+
+  const distributeOne = async (tokenAddress) => {
+    if (!provider || !account) return;
+    setStatus(`Distributing ${tokenAddress}...`);
+    try {
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, ["function distribute(address token)"], signer);
+      const tx = await contract.distribute(tokenAddress);
+      await tx.wait();
+      setStatus(`Token ${tokenAddress} distributed!`);
+    } catch (err) {
+      setStatus('Distribution failed.');
+      console.error(err);
+    }
+  };
 
   return (
-    <div className="container">
+    <div className="App">
       <h1>Teksplitter</h1>
-      <p><strong>Contract:</strong> <code>{CONTRACT_ADDRESS}</code></p>
+      <p>Contract address: <code>{CONTRACT_ADDRESS}</code></p>
 
-      {!walletConnected ? (
-        <button onClick={connectWallet}>Connect MetaMask</button>
-      ) : (
+      {!account && <button onClick={connectWallet}>Connect Metamask</button>}
+      {account && <p>Connected: {account}</p>}
+
+      {account && (
         <>
-          <p><strong>Wallet:</strong> {account}</p>
-
-          <h3>Token presenti nel contratto:</h3>
-          {tokenList.length === 0 ? (
-            <p>Nessun token rilevato.</p>
-          ) : (
-            <ul>
-              {tokenList.map((tk, idx) => (
-                <li key={idx}>
-                  {tk.symbol} – {ethers.formatUnits(tk.balance, tk.decimals)}{' '}
-                  (<code>{tk.address}</code>)
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <p style={{ marginTop: '1rem', color: '#555' }}>
-            Ora puoi distribuire tutto o token specifici.
-          </p>
+          <button onClick={fetchTokens}>Fetch Tokens</button>
+          <button onClick={distributeAll}>Distribute All</button>
         </>
       )}
 
-      <p>{status}</p>
+      {status && <p>Status: {status}</p>}
+
+      {tokens.length > 0 && (
+        <div>
+          <h3>Tokens in Contract:</h3>
+          <ul>
+            {tokens.map((token, index) => (
+              <li key={index}>
+                <strong>{token.name}</strong> ({token.symbol})<br />
+                Balance: {(token.balance / 10 ** token.decimals).toLocaleString()}<br />
+                <button onClick={() => distributeOne(token.address)}>Distribute this token</button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }
